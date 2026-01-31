@@ -1,7 +1,7 @@
 {
   "id": "projects-ux",
   "name": "Projects UX",
-  "description": "Project picker + /project commands + prompt framing + optional per-project roomKey routing (Phase 2).",
+  "description": "Project picker + /projects commands + prompt framing + optional per-project roomKey routing (Phase 2).",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,

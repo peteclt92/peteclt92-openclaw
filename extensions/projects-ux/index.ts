@@ -127,20 +127,20 @@ function buildProjectButtons(peer: PeerState | undefined) {
   const enabled = peer?.projectsEnabled === true;
   rows.push([
     enabled
-      ? { text: "Projects: ON", callback_data: "/project off" }
-      : { text: "Projects: OFF (Classic)", callback_data: "/project on" },
+      ? { text: "Projects: ON", callback_data: "/projects off" }
+      : { text: "Projects: OFF (Classic)", callback_data: "/projects on" },
   ]);
 
   for (let i = 0; i < top.length; i += 2) {
     const row: Array<{ text: string; callback_data: string }> = [];
     const a = top[i];
     const b = top[i + 1];
-    if (a) row.push({ text: a.name, callback_data: `/project switch ${a.id}` });
-    if (b) row.push({ text: b.name, callback_data: `/project switch ${b.id}` });
+    if (a) row.push({ text: a.name, callback_data: `/projects switch ${a.id}` });
+    if (b) row.push({ text: b.name, callback_data: `/projects switch ${b.id}` });
     rows.push(row);
   }
 
-  rows.push([{ text: "New project", callback_data: "/project new" }]);
+  rows.push([{ text: "New project", callback_data: "/projects new" }]);
   return rows;
 }
 
@@ -274,12 +274,7 @@ export default function (api: any) {
   // Commands
   // -----------------------------
 
-  api.registerCommand({
-    name: "project",
-    description: "Manage bot-managed projects (Phase 1/2: UX + optional per-project session routing).",
-    acceptsArgs: true,
-    requireAuth: true,
-    handler: async (ctx: any) => {
+  const handleProjectsCommand = async (ctx: any) => {
       const peerKey = buildPeerKeyFromCommandCtx(ctx);
       const args = (ctx.args ?? "").trim();
       const messageId = typeof ctx.messageId === "number" ? ctx.messageId : undefined;
@@ -290,18 +285,19 @@ export default function (api: any) {
           "- Classic (OFF): one normal chat history\n" +
           "- Projects (ON): separate history per project\n\n" +
           "Commands:\n" +
-          "/project\n" +
-          "/project on\n" +
-          "/project off\n" +
-          "/project list\n" +
-          "/project new <name>\n" +
-          "/project switch <name|id>\n",
+          "/projects\n" +
+          "/projects on\n" +
+          "/projects off\n" +
+          "/projects list\n" +
+          "/projects new <name>\n" +
+          "/projects switch <name|id>\n\n" +
+          "Alias (deprecated): /project",
       });
 
-      // /project new (no args) -> prompt user
+      // /projects new (no args) -> prompt user
       if (args === "new") {
         return {
-          text: "Usage: /project new <name>",
+          text: "Usage: /projects new <name>",
         };
       }
 
@@ -326,7 +322,7 @@ export default function (api: any) {
           text:
             `${modeLine}${warning}\n\n` +
             `Active project: ${current}\n\n` +
-            "Use /project on/off, /project list, /project new <name>, or /project switch <name|id>.",
+            "Use /projects on/off, /projects list, /projects new <name>, or /projects switch <name|id>.",
           channelData: {
             telegram: {
               buttons: buildProjectButtons(peer),
@@ -391,7 +387,7 @@ export default function (api: any) {
         const store = await loadStore(storagePath);
         const peer = store.peers[peerKey] as PeerState | undefined;
         if (!peer) {
-          return { text: "Mode: Classic (Projects OFF)\n\nNo projects yet. Use /project on, /project new <name>." };
+          return { text: "Mode: Classic (Projects OFF)\n\nNo projects yet. Use /projects on, /projects new <name>." };
         }
         ensureDefaultProject(peer, defaultProjectName);
         const enabled = peer.projectsEnabled === true;
@@ -410,7 +406,7 @@ export default function (api: any) {
 
       if (sub === "new") {
         const name = args.slice(3).trim(); // remove "new"
-        if (!name) return { text: "Usage: /project new <name>" };
+        if (!name) return { text: "Usage: /projects new <name>" };
 
         const out = await withPeerState(storagePath, peerKey, (peer) => {
           ensureDefaultProject(peer, defaultProjectName);
@@ -455,7 +451,7 @@ export default function (api: any) {
 
       if (sub === "switch") {
         const key = args.slice("switch".length).trim();
-        if (!key) return { text: "Usage: /project switch <name|id>" };
+        if (!key) return { text: "Usage: /projects switch <name|id>" };
         const out = await withPeerState(storagePath, peerKey, (peer) => {
           ensureDefaultProject(peer, defaultProjectName);
           peer.projectsEnabled = true;
@@ -479,6 +475,31 @@ export default function (api: any) {
       }
 
       return help();
+  };
+
+  api.registerCommand({
+    name: "projects",
+    description: "Manage Projects mode + project list/switching (Phase 1/2 UX + optional per-project routing).",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: handleProjectsCommand,
+  });
+
+  // Backward-compat alias. Keep docs/UI on /projects.
+  api.registerCommand({
+    name: "project",
+    description: "(Deprecated) Alias for /projects.",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: async (ctx: any) => {
+      const res = await handleProjectsCommand(ctx);
+      if (!res) return res;
+
+      const prefix = "Note: /project is deprecated — use /projects.\n\n";
+      if (typeof (res as any).text === "string" && (res as any).text.trim()) {
+        return { ...res, text: prefix + (res as any).text };
+      }
+      return { ...res, text: prefix.trim() };
     },
   });
 
