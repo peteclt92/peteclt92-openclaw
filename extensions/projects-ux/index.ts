@@ -12,6 +12,9 @@ type Project = {
 
 type PeerState = {
   version: 1;
+  /** When false, route messages to the Classic (base) session (no :proj: suffix). */
+  projectsEnabled?: boolean;
+
   activeProjectId: string;
   // Previously active project (used for deterministic switch semantics).
   previousProjectId?: string;
@@ -109,7 +112,8 @@ function renderProjectList(projects: Project[]) {
     .join("\n");
 }
 
-function buildSwitchButtons(projects: Project[]) {
+function buildProjectButtons(peer: PeerState | undefined) {
+  const projects = peer?.projects ?? [];
   const active = projects.filter((p) => !p.archived);
   const top = active
     .sort((a, b) => (b.lastUsedAt ?? b.createdAt).localeCompare(a.lastUsedAt ?? a.createdAt))
@@ -118,6 +122,15 @@ function buildSwitchButtons(projects: Project[]) {
   // Telegram inline keyboard is rows of buttons.
   // Keep it simple: 2 columns.
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+
+  // Mode toggle row first.
+  const enabled = peer?.projectsEnabled === true;
+  rows.push([
+    enabled
+      ? { text: "Projects: ON", callback_data: "/project off" }
+      : { text: "Projects: OFF (Classic)", callback_data: "/project on" },
+  ]);
+
   for (let i = 0; i < top.length; i += 2) {
     const row: Array<{ text: string; callback_data: string }> = [];
     const a = top[i];
@@ -126,6 +139,7 @@ function buildSwitchButtons(projects: Project[]) {
     if (b) row.push({ text: b.name, callback_data: `/project switch ${b.id}` });
     rows.push(row);
   }
+
   rows.push([{ text: "New project", callback_data: "/project new" }]);
   return rows;
 }
@@ -154,6 +168,7 @@ async function withPeerState<T>(filePath: string, peerKey: string, fn: (peer: Pe
     ? existing
     : {
         version: 1,
+        projectsEnabled: false,
         activeProjectId: "",
         projects: [],
       };
@@ -165,8 +180,15 @@ async function withPeerState<T>(filePath: string, peerKey: string, fn: (peer: Pe
 }
 
 function ensureDefaultProject(peer: PeerState, defaultProjectName: string) {
+  // Migration: older versions used "Inbox" as the default project name.
+  for (const p of peer.projects) {
+    if ((p.name ?? "").trim().toLowerCase() === "inbox") {
+      p.name = defaultProjectName;
+    }
+  }
+
   if (peer.projects.length === 0) {
-    const id = `inbox-${slugifyId(defaultProjectName) || "inbox"}`;
+    const id = `proj-${slugifyId(defaultProjectName) || "general"}`;
     const p: Project = { id, name: defaultProjectName, createdAt: nowIso(), lastUsedAt: nowIso() };
     peer.projects.push(p);
     peer.activeProjectId = id;
@@ -176,6 +198,11 @@ function ensureDefaultProject(peer: PeerState, defaultProjectName: string) {
   if (!peer.activeProjectId) {
     const first = peer.projects.find((p) => !p.archived) ?? peer.projects[0];
     if (first) peer.activeProjectId = first.id;
+  }
+
+  // Default OFF unless explicitly enabled.
+  if (typeof peer.projectsEnabled !== "boolean") {
+    peer.projectsEnabled = false;
   }
 }
 
@@ -192,7 +219,7 @@ function findProject(peer: PeerState, key: string): Project | null {
 export default function (api: any) {
   const cfg = api.pluginConfig ?? {};
   const storagePath = api.resolvePath?.(cfg.storagePath ?? "~/.openclaw/projects-ux/state.json") ?? "~/.openclaw/projects-ux/state.json";
-  const defaultProjectName = String(cfg.defaultProjectName ?? "Inbox");
+  const defaultProjectName = String(cfg.defaultProjectName ?? "General");
   const maxProjects = Number.isFinite(cfg.maxProjects) ? Math.trunc(cfg.maxProjects) : 50;
   const maxInjectedNoteChars = Number.isFinite(cfg.maxInjectedNoteChars) ? Math.trunc(cfg.maxInjectedNoteChars) : 600;
   const maxPrefixChars = Number.isFinite(cfg.maxPrefixChars) ? Math.trunc(cfg.maxPrefixChars) : 240;
@@ -259,9 +286,13 @@ export default function (api: any) {
 
       const help = () => ({
         text:
-          "Projects (Phase 1): project switching + scoped context (not hard isolation).\n\n" +
+          "Projects mode is a routing mode:\n" +
+          "- Classic (OFF): one normal chat history\n" +
+          "- Projects (ON): separate history per project\n\n" +
           "Commands:\n" +
           "/project\n" +
+          "/project on\n" +
+          "/project off\n" +
           "/project list\n" +
           "/project new <name>\n" +
           "/project switch <name|id>\n",
@@ -280,15 +311,25 @@ export default function (api: any) {
       if (!sub) {
         const store = await loadStore(storagePath);
         const peer = store.peers[peerKey] as PeerState | undefined;
+
+        const enabled = peer?.projectsEnabled === true;
+        const modeLine = enabled ? "Mode: Projects ON" : "Mode: Classic (Projects OFF)";
+
         const p = peer?.projects?.find((x) => x.id === peer?.activeProjectId) ?? null;
         const current = p ? `${p.name} (${p.id})` : "(none)";
+
+        const warning = enabled
+          ? ""
+          : "\n\nProjects are OFF. Turning ON creates separate histories.";
+
         return {
           text:
+            `${modeLine}${warning}\n\n` +
             `Active project: ${current}\n\n` +
-            "Use /project list, /project new <name>, or /project switch <name|id>.",
+            "Use /project on/off, /project list, /project new <name>, or /project switch <name|id>.",
           channelData: {
             telegram: {
-              buttons: buildSwitchButtons(peer?.projects ?? []),
+              buttons: buildProjectButtons(peer),
             },
           },
         };
@@ -296,17 +337,72 @@ export default function (api: any) {
 
       if (sub === "help") return help();
 
+      if (sub === "on") {
+        const out = await withPeerState(storagePath, peerKey, (peer) => {
+          ensureDefaultProject(peer, defaultProjectName);
+          peer.projectsEnabled = true;
+
+          // Pick last project if still available, otherwise keep active or default.
+          const last = peer.lastProjectId
+            ? peer.projects.find((p) => p.id === peer.lastProjectId && !p.archived)
+            : null;
+          const active = peer.activeProjectId
+            ? peer.projects.find((p) => p.id === peer.activeProjectId && !p.archived)
+            : null;
+          const chosen = last ?? active ?? peer.projects.find((p) => !p.archived) ?? peer.projects[0] ?? null;
+          if (chosen) {
+            peer.previousProjectId = peer.activeProjectId || peer.previousProjectId;
+            peer.activeProjectId = chosen.id;
+            peer.lastProjectId = chosen.id;
+            chosen.lastUsedAt = nowIso();
+            peer.pendingReset = true;
+          }
+
+          if (ctx.channel === "telegram" && typeof messageId === "number") {
+            peer.effectiveFromMessageId = messageId;
+          }
+
+          return { ok: true, project: chosen };
+        });
+
+        const res = out.result;
+        const p = res.project;
+        const current = p ? `${p.name} (${p.id})` : "(none)";
+        return { text: `Projects ON. Active: ${current}` };
+      }
+
+      if (sub === "off") {
+        await withPeerState(storagePath, peerKey, (peer) => {
+          ensureDefaultProject(peer, defaultProjectName);
+          peer.projectsEnabled = false;
+
+          if (ctx.channel === "telegram" && typeof messageId === "number") {
+            // Store messageId so a future "on" can be deterministic, and to keep debugging simple.
+            peer.effectiveFromMessageId = messageId;
+          }
+
+          return { ok: true };
+        });
+
+        return { text: "Projects OFF (Classic). Next messages go to Classic history." };
+      }
+
       if (sub === "list") {
         const store = await loadStore(storagePath);
         const peer = store.peers[peerKey] as PeerState | undefined;
-        if (!peer) return { text: "No projects yet. Use /project new <name>." };
+        if (!peer) {
+          return { text: "Mode: Classic (Projects OFF)\n\nNo projects yet. Use /project on, /project new <name>." };
+        }
+        ensureDefaultProject(peer, defaultProjectName);
+        const enabled = peer.projectsEnabled === true;
+        const modeLine = enabled ? "Mode: Projects ON" : "Mode: Classic (Projects OFF)";
         const active = peer.projects.find((p) => p.id === peer.activeProjectId);
         const header = active ? `Active: ${active.name} (${active.id})` : "Active: (none)";
         return {
-          text: header + "\n\n" + renderProjectList(peer.projects),
+          text: modeLine + "\n" + header + "\n\n" + renderProjectList(peer.projects),
           channelData: {
             telegram: {
-              buttons: buildSwitchButtons(peer.projects),
+              buttons: buildProjectButtons(peer),
             },
           },
         };
@@ -318,6 +414,7 @@ export default function (api: any) {
 
         const out = await withPeerState(storagePath, peerKey, (peer) => {
           ensureDefaultProject(peer, defaultProjectName);
+          peer.projectsEnabled = true;
           const existing = peer.projects.find((p) => !p.archived && p.name.toLowerCase() === name.toLowerCase());
           if (existing) {
             peer.previousProjectId = peer.activeProjectId || peer.previousProjectId;
@@ -361,6 +458,7 @@ export default function (api: any) {
         if (!key) return { text: "Usage: /project switch <name|id>" };
         const out = await withPeerState(storagePath, peerKey, (peer) => {
           ensureDefaultProject(peer, defaultProjectName);
+          peer.projectsEnabled = true;
           const project = findProject(peer, key);
           if (!project || project.archived) {
             return { ok: false, error: `Project not found: ${key}` };
@@ -423,6 +521,8 @@ export default function (api: any) {
       }
 
       ensureDefaultProject(peer, defaultProjectName);
+      if (peer.projectsEnabled !== true) return undefined;
+
       const active = peer.projects.find((p) => p.id === peer.activeProjectId) ?? null;
       if (!active) return undefined;
 
@@ -485,6 +585,7 @@ export default function (api: any) {
       if (!peer) return undefined;
 
       ensureDefaultProject(peer, defaultProjectName);
+      if (peer.projectsEnabled !== true) return undefined;
 
       const msgId = typeof event?.messageId === "number" ? event.messageId : undefined;
       const effectiveFrom = typeof peer.effectiveFromMessageId === "number" ? peer.effectiveFromMessageId : undefined;

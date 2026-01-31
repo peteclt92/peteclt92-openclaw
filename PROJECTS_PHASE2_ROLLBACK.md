@@ -9,7 +9,14 @@ Use this if Phase 2 routing causes missing replies, misrouting, or instability.
 
 ## Rollback Steps
 
-### 1) Disable Phase 2 (preferred)
+### 1) Exit Projects mode (no restart)
+If you just want to stop using per-project transcripts immediately:
+- Run: `/project off`
+- Verify the bot replies: "Projects OFF (Classic). Next messages go to Classic history."
+
+This keeps projects intact; it just routes messages back to the classic (base) DM session.
+
+### 2) Disable Phase 2 (preferred global rollback)
 - Set the Projects UX Phase 2 flag to off in OpenClaw config:
   - `plugins.entries.projects-ux.config.hardIsolation.enabled = false`
 - Restart gateway.
@@ -31,5 +38,8 @@ Use this if Phase 2 routing causes missing replies, misrouting, or instability.
 ## Data retention note
 Project state is stored at:
 - `~/.openclaw/projects-ux/state.json`
+
+You can also force Classic mode per-DM by editing the state file and setting:
+- `peers["telegram:<peerId>"].projectsEnabled = false`
 
 Rollback does not delete state.

@@ -7,7 +7,7 @@
     "additionalProperties": false,
     "properties": {
       "enabled": { "type": "boolean", "default": true },
-      "defaultProjectName": { "type": "string", "default": "Inbox" },
+      "defaultProjectName": { "type": "string", "default": "General" },
       "maxProjects": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
       "maxInjectedNoteChars": { "type": "integer", "minimum": 0, "maximum": 4000, "default": 600 },
       "maxPrefixChars": { "type": "integer", "minimum": 50, "maximum": 1000, "default": 240 },
