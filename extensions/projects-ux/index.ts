@@ -8,6 +8,9 @@ type Project = {
   createdAt: string;
   lastUsedAt?: string;
   note?: string;
+
+  // Projects-scoped durable memory (managed by /memory).
+  tokens?: string[];
 };
 
 type PeerState = {
@@ -23,6 +26,9 @@ type PeerState = {
   lastProjectId?: string;
   pendingReset?: boolean;
   projects: Project[];
+
+  // Global (cross-project) durable memory (managed by /memory global ...).
+  globalTokens?: string[];
 };
 
 type Store = {
@@ -182,20 +188,37 @@ async function withPeerState<T>(filePath: string, peerKey: string, fn: (peer: Pe
 
 function ensureDefaultProject(peer: PeerState, defaultProjectName: string) {
   // Migration: older versions used "Inbox" as the default project name.
+  // Users read "Inbox" as "the classic chat" which is not true in Projects mode.
+  // Rename it to the configured default (default: General).
   for (const p of peer.projects) {
-    if ((p.name ?? "").trim().toLowerCase() === "inbox") {
+    const name = (p.name ?? "").trim().toLowerCase();
+    const id = (p.id ?? "").trim().toLowerCase();
+    if (name === "inbox" || id === "proj-inbox" || id.startsWith("inbox-")) {
       p.name = defaultProjectName;
     }
   }
 
   if (peer.projects.length === 0) {
     const id = `proj-${slugifyId(defaultProjectName) || "general"}`;
-    const p: Project = { id, name: defaultProjectName, createdAt: nowIso(), lastUsedAt: nowIso() };
+    const p: Project = {
+      id,
+      name: defaultProjectName,
+      createdAt: nowIso(),
+      lastUsedAt: nowIso(),
+      tokens: [],
+    };
     peer.projects.push(p);
     peer.activeProjectId = id;
     peer.lastProjectId = id;
     peer.pendingReset = false;
   }
+
+  // Ensure tokens arrays exist.
+  for (const p of peer.projects) {
+    if (!Array.isArray(p.tokens)) p.tokens = [];
+  }
+  if (!Array.isArray(peer.globalTokens)) peer.globalTokens = [];
+
   if (!peer.activeProjectId) {
     const first = peer.projects.find((p) => !p.archived) ?? peer.projects[0];
     if (first) peer.activeProjectId = first.id;
@@ -292,7 +315,12 @@ export default function (api: any) {
           "/projects list\n" +
           "/projects new <name>\n" +
           "/projects switch <name|id>\n\n" +
-          "Alias (deprecated): /project",
+          "Alias (deprecated): /project\n\n" +
+          "Durable memory (scoped by default):\n" +
+          "/memory remember <token>\n" +
+          "/memory list\n" +
+          "/memory global remember <token>\n" +
+          "/memory global list\n",
       });
 
       // /projects new (no args) -> prompt user
@@ -333,6 +361,42 @@ export default function (api: any) {
       }
 
       if (sub === "help") return help();
+
+      if (sub === "debug") {
+        const store = await loadStore(storagePath);
+        const peer = store.peers[peerKey] as PeerState | undefined;
+        if (!peer) {
+          return {
+            text:
+              "No peer state yet.\n\n" +
+              "Send /projects on or /projects new <name> to initialize Projects state for this DM.",
+          };
+        }
+
+        ensureDefaultProject(peer, defaultProjectName);
+
+        const enabled = peer.projectsEnabled === true;
+        const active = peer.projects.find((p) => p.id === peer.activeProjectId) ?? null;
+        const prev = peer.previousProjectId ?? "(none)";
+        const eff = typeof peer.effectiveFromMessageId === "number" ? peer.effectiveFromMessageId : null;
+
+        const suffix = active ? sanitizeRoomKeySuffixToken(active.id) : "";
+        const routing =
+          hardIsolationEnabled && enabled && suffix
+            ? `will append :proj:${suffix} to the base DM session key`
+            : "will NOT append any :proj: suffix (Classic/base session)";
+
+        const lines = [
+          `Mode: ${enabled ? "Projects ON" : "Classic (Projects OFF)"}`,
+          `hardIsolationEnabled: ${hardIsolationEnabled ? "true" : "false"}`,
+          `activeProject: ${active ? `${active.name} (${active.id})` : "(none)"}`,
+          `previousProjectId: ${prev}`,
+          `effectiveFromMessageId: ${eff ?? "(none)"}`,
+          `Routing: ${routing}`,
+        ];
+
+        return { text: lines.join("\n") };
+      }
 
       if (sub === "on") {
         const out = await withPeerState(storagePath, peerKey, (peer) => {
@@ -484,6 +548,104 @@ export default function (api: any) {
     acceptsArgs: true,
     requireAuth: true,
     handler: handleProjectsCommand,
+  });
+
+  // Durable memory surface.
+  api.registerCommand({
+    name: "memory",
+    description: "Project-scoped memory (default) + global memory (explicit).",
+    acceptsArgs: true,
+    requireAuth: true,
+    handler: async (ctx: any) => {
+      const peerKey = buildPeerKeyFromCommandCtx(ctx);
+      const args = (ctx.args ?? "").trim();
+      const parts = args ? args.split(/\s+/) : [];
+      const sub = (parts[0] ?? "").toLowerCase();
+
+      const help = () => ({
+        text:
+          "Memory is separate from transcript history.\n" +
+          "Default scope is the current project.\n\n" +
+          "Commands:\n" +
+          "/memory remember <token>\n" +
+          "/memory list\n" +
+          "/memory global remember <token>\n" +
+          "/memory global list\n",
+      });
+
+      if (!sub || sub === "help") return help();
+
+      const store = await loadStore(storagePath);
+      const peer = store.peers[peerKey] as PeerState | undefined;
+      if (!peer) {
+        return {
+          text:
+            "No Projects state for this chat yet.\n\n" +
+            "Run /projects on (or /projects new <name>) first, then use /memory remember ...\n" +
+            "Or use /memory global remember ...",
+        };
+      }
+
+      ensureDefaultProject(peer, defaultProjectName);
+
+      const isGlobal = sub === "global";
+      const sub2 = isGlobal ? (parts[1] ?? "").toLowerCase() : sub;
+      const rest = isGlobal ? parts.slice(2).join(" ").trim() : parts.slice(1).join(" ").trim();
+
+      if (isGlobal) {
+        if (!sub2) return help();
+
+        if (sub2 === "remember") {
+          const token = rest.trim();
+          if (!token) return { text: "Usage: /memory global remember <token>" };
+          peer.globalTokens = Array.isArray(peer.globalTokens) ? peer.globalTokens : [];
+          if (!peer.globalTokens.includes(token)) peer.globalTokens.push(token);
+          store.peers[peerKey] = peer;
+          await writeStoreAndRefreshCache(store);
+          return { text: `Saved globally: ${token}` };
+        }
+
+        if (sub2 === "list") {
+          const tokens = Array.isArray(peer.globalTokens) ? peer.globalTokens : [];
+          if (tokens.length === 0) return { text: "No global tokens saved." };
+          return { text: "Global tokens:\n" + tokens.map((t) => `- ${t}`).join("\n") };
+        }
+
+        return help();
+      }
+
+      // Project-scoped memory requires Projects mode ON so the scope is unambiguous.
+      if (peer.projectsEnabled !== true) {
+        return {
+          text:
+            "Projects are OFF (Classic).\n\n" +
+            "Turn Projects ON to use project-scoped memory, or use /memory global ...\n\n" +
+            "- /projects on\n" +
+            "- /memory global remember <token>",
+        };
+      }
+
+      const active = peer.projects.find((p) => p.id === peer.activeProjectId) ?? null;
+      if (!active) return { text: "No active project." };
+      if (!Array.isArray(active.tokens)) active.tokens = [];
+
+      if (sub === "remember") {
+        const token = rest.trim();
+        if (!token) return { text: "Usage: /memory remember <token>" };
+        if (!active.tokens.includes(token)) active.tokens.push(token);
+        store.peers[peerKey] = peer;
+        await writeStoreAndRefreshCache(store);
+        return { text: `Saved in project ${active.name}: ${token}` };
+      }
+
+      if (sub === "list") {
+        const tokens = Array.isArray(active.tokens) ? active.tokens : [];
+        if (tokens.length === 0) return { text: `No tokens saved in project ${active.name}.` };
+        return { text: `Tokens in project ${active.name}:\n` + tokens.map((t) => `- ${t}`).join("\n") };
+      }
+
+      return help();
+    },
   });
 
   // Backward-compat alias. Keep docs/UI on /projects.
