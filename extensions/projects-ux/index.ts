@@ -355,6 +355,17 @@ export default function (api: any) {
       }
 
       const prependContext = clampText(prefixLines.join("\n"), maxPrefixChars);
+
+      // Debug: log when we actually inject framing.
+      try {
+        const log = api?.logger?.info ? api.logger : null;
+        const msg = `[projects-ux] before_agent_start inject peer=${peerKey} active=${active.id} pendingReset=${peer.pendingReset ? "true" : "false"} prependLen=${prependContext.length}`;
+        if (log) log.info(msg);
+        else console.log(msg);
+      } catch {
+        // ignore
+      }
+
       return { prependContext };
     },
     { priority: 100 }
