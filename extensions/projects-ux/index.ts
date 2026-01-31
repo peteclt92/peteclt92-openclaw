@@ -186,15 +186,20 @@ async function withPeerState<T>(filePath: string, peerKey: string, fn: (peer: Pe
   return { store, result };
 }
 
-function ensureDefaultProject(peer: PeerState, defaultProjectName: string) {
+function ensureDefaultProject(peer: PeerState, defaultProjectName: string): boolean {
+  let changed = false;
+
   // Migration: older versions used "Inbox" as the default project name.
   // Users read "Inbox" as "the classic chat" which is not true in Projects mode.
-  // Rename it to the configured default (default: General).
+  // Rename it to the configured default (default: General) and persist.
   for (const p of peer.projects) {
     const name = (p.name ?? "").trim().toLowerCase();
     const id = (p.id ?? "").trim().toLowerCase();
     if (name === "inbox" || id === "proj-inbox" || id.startsWith("inbox-")) {
-      p.name = defaultProjectName;
+      if (p.name !== defaultProjectName) {
+        p.name = defaultProjectName;
+        changed = true;
+      }
     }
   }
 
@@ -211,23 +216,36 @@ function ensureDefaultProject(peer: PeerState, defaultProjectName: string) {
     peer.activeProjectId = id;
     peer.lastProjectId = id;
     peer.pendingReset = false;
+    changed = true;
   }
 
   // Ensure tokens arrays exist.
   for (const p of peer.projects) {
-    if (!Array.isArray(p.tokens)) p.tokens = [];
+    if (!Array.isArray(p.tokens)) {
+      p.tokens = [];
+      changed = true;
+    }
   }
-  if (!Array.isArray(peer.globalTokens)) peer.globalTokens = [];
+  if (!Array.isArray(peer.globalTokens)) {
+    peer.globalTokens = [];
+    changed = true;
+  }
 
   if (!peer.activeProjectId) {
     const first = peer.projects.find((p) => !p.archived) ?? peer.projects[0];
-    if (first) peer.activeProjectId = first.id;
+    if (first) {
+      peer.activeProjectId = first.id;
+      changed = true;
+    }
   }
 
   // Default OFF unless explicitly enabled.
   if (typeof peer.projectsEnabled !== "boolean") {
     peer.projectsEnabled = false;
+    changed = true;
   }
+
+  return changed;
 }
 
 function findProject(peer: PeerState, key: string): Project | null {
@@ -337,6 +355,14 @@ export default function (api: any) {
         const store = await loadStore(storagePath);
         const peer = store.peers[peerKey] as PeerState | undefined;
 
+        if (peer) {
+          const changed = ensureDefaultProject(peer, defaultProjectName);
+          if (changed) {
+            store.peers[peerKey] = peer;
+            await writeStoreAndRefreshCache(store);
+          }
+        }
+
         const enabled = peer?.projectsEnabled === true;
         const modeLine = enabled ? "Mode: Projects ON" : "Mode: Classic (Projects OFF)";
 
@@ -373,7 +399,11 @@ export default function (api: any) {
           };
         }
 
-        ensureDefaultProject(peer, defaultProjectName);
+        const changed = ensureDefaultProject(peer, defaultProjectName);
+        if (changed) {
+          store.peers[peerKey] = peer;
+          await writeStoreAndRefreshCache(store);
+        }
 
         const enabled = peer.projectsEnabled === true;
         const active = peer.projects.find((p) => p.id === peer.activeProjectId) ?? null;
@@ -454,7 +484,11 @@ export default function (api: any) {
         if (!peer) {
           return { text: "Mode: Classic (Projects OFF)\n\nNo projects yet. Use /projects on, /projects new <name>." };
         }
-        ensureDefaultProject(peer, defaultProjectName);
+        const changed = ensureDefaultProject(peer, defaultProjectName);
+        if (changed) {
+          store.peers[peerKey] = peer;
+          await writeStoreAndRefreshCache(store);
+        }
         const enabled = peer.projectsEnabled === true;
         const modeLine = enabled ? "Mode: Projects ON" : "Mode: Classic (Projects OFF)";
         const active = peer.projects.find((p) => p.id === peer.activeProjectId);
@@ -586,7 +620,11 @@ export default function (api: any) {
         };
       }
 
-      ensureDefaultProject(peer, defaultProjectName);
+      const changed = ensureDefaultProject(peer, defaultProjectName);
+      if (changed) {
+        store.peers[peerKey] = peer;
+        await writeStoreAndRefreshCache(store);
+      }
 
       const isGlobal = sub === "global";
       const sub2 = isGlobal ? (parts[1] ?? "").toLowerCase() : sub;
@@ -704,7 +742,11 @@ export default function (api: any) {
         return undefined;
       }
 
-      ensureDefaultProject(peer, defaultProjectName);
+      const changed = ensureDefaultProject(peer, defaultProjectName);
+      if (changed) {
+        store.peers[peerKey] = peer;
+        await writeStoreAndRefreshCache(store);
+      }
       if (peer.projectsEnabled !== true) return undefined;
 
       const active = peer.projects.find((p) => p.id === peer.activeProjectId) ?? null;
@@ -768,7 +810,11 @@ export default function (api: any) {
       const peer = store.peers[peerKey] as PeerState | undefined;
       if (!peer) return undefined;
 
-      ensureDefaultProject(peer, defaultProjectName);
+      const changed = ensureDefaultProject(peer, defaultProjectName);
+      if (changed) {
+        store.peers[peerKey] = peer;
+        await writeStoreAndRefreshCache(store);
+      }
       if (peer.projectsEnabled !== true) return undefined;
 
       const msgId = typeof event?.messageId === "number" ? event.messageId : undefined;
