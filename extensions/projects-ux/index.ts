@@ -124,11 +124,12 @@ function buildProjectButtons(peer: PeerState | undefined) {
   const rows: Array<Array<{ text: string; callback_data: string }>> = [];
 
   // Mode toggle row first.
+  // Button text should describe the action (not just display the current state).
   const enabled = peer?.projectsEnabled === true;
   rows.push([
     enabled
-      ? { text: "Projects: ON", callback_data: "/projects off" }
-      : { text: "Projects: OFF (Classic)", callback_data: "/projects on" },
+      ? { text: "Turn Projects OFF (Classic)", callback_data: "/projects off" }
+      : { text: "Turn Projects ON", callback_data: "/projects on" },
   ]);
 
   for (let i = 0; i < top.length; i += 2) {
