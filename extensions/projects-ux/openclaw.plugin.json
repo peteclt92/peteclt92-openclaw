@@ -1,7 +1,7 @@
 {
   "id": "projects-ux",
   "name": "Projects UX",
-  "description": "Project picker + /project commands + prompt framing (Phase 1; no hard isolation).",
+  "description": "Project picker + /project commands + prompt framing + optional per-project roomKey routing (Phase 2).",
   "configSchema": {
     "type": "object",
     "additionalProperties": false,
@@ -11,7 +11,15 @@
       "maxProjects": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 },
       "maxInjectedNoteChars": { "type": "integer", "minimum": 0, "maximum": 4000, "default": 600 },
       "maxPrefixChars": { "type": "integer", "minimum": 50, "maximum": 1000, "default": 240 },
-      "storagePath": { "type": "string", "default": "~/.openclaw/projects-ux/state.json" }
+      "storagePath": { "type": "string", "default": "~/.openclaw/projects-ux/state.json" },
+      "hardIsolation": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "enabled": { "type": "boolean", "default": false }
+        },
+        "default": { "enabled": false }
+      }
     }
   }
 }

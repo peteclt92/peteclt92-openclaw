@@ -13,6 +13,10 @@ type Project = {
 type PeerState = {
   version: 1;
   activeProjectId: string;
+  // Previously active project (used for deterministic switch semantics).
+  previousProjectId?: string;
+  // Message id from which the current activeProjectId becomes effective (channel-specific).
+  effectiveFromMessageId?: number;
   lastProjectId?: string;
   pendingReset?: boolean;
   projects: Project[];
@@ -134,6 +138,15 @@ async function loadStore(filePath: string): Promise<Store> {
   return { version: 1, peers: {} };
 }
 
+function sanitizeRoomKeySuffixToken(input: string) {
+  return (input ?? "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_-]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+}
+
 async function withPeerState<T>(filePath: string, peerKey: string, fn: (peer: PeerState) => T): Promise<{ store: Store; result: T }> {
   const store = await loadStore(filePath);
   const existing = store.peers[peerKey];
@@ -184,18 +197,65 @@ export default function (api: any) {
   const maxInjectedNoteChars = Number.isFinite(cfg.maxInjectedNoteChars) ? Math.trunc(cfg.maxInjectedNoteChars) : 600;
   const maxPrefixChars = Number.isFinite(cfg.maxPrefixChars) ? Math.trunc(cfg.maxPrefixChars) : 240;
 
+  const hardIsolationEnabled = Boolean(cfg?.hardIsolation?.enabled);
+
+  // In-memory store cache (avoid reading JSON on every inbound message).
+  let cachedStore: Store | null = null;
+  let cachedStoreLoadedAtMs = 0;
+  let cachedStoreMtimeMs = 0;
+
+  async function loadStoreCached(): Promise<Store> {
+    const now = Date.now();
+    // TTL-based refresh to cap stat() overhead.
+    const ttlMs = 1000;
+    if (cachedStore && now - cachedStoreLoadedAtMs < ttlMs) return cachedStore;
+
+    try {
+      const st = await fs.stat(storagePath);
+      const mtime = st.mtimeMs;
+      if (cachedStore && mtime === cachedStoreMtimeMs) {
+        cachedStoreLoadedAtMs = now;
+        return cachedStore;
+      }
+      const store = await loadStore(storagePath);
+      cachedStore = store;
+      cachedStoreLoadedAtMs = now;
+      cachedStoreMtimeMs = mtime;
+      return store;
+    } catch {
+      const store = await loadStore(storagePath);
+      cachedStore = store;
+      cachedStoreLoadedAtMs = now;
+      cachedStoreMtimeMs = 0;
+      return store;
+    }
+  }
+
+  async function writeStoreAndRefreshCache(store: Store) {
+    await writeJsonAtomic(storagePath, store);
+    cachedStore = store;
+    cachedStoreLoadedAtMs = Date.now();
+    try {
+      const st = await fs.stat(storagePath);
+      cachedStoreMtimeMs = st.mtimeMs;
+    } catch {
+      cachedStoreMtimeMs = 0;
+    }
+  }
+
   // -----------------------------
   // Commands
   // -----------------------------
 
   api.registerCommand({
     name: "project",
-    description: "Manage bot-managed projects (Phase 1: UX only; no hard isolation).",
+    description: "Manage bot-managed projects (Phase 1/2: UX + optional per-project session routing).",
     acceptsArgs: true,
     requireAuth: true,
     handler: async (ctx: any) => {
       const peerKey = buildPeerKeyFromCommandCtx(ctx);
       const args = (ctx.args ?? "").trim();
+      const messageId = typeof ctx.messageId === "number" ? ctx.messageId : undefined;
 
       const help = () => ({
         text:
@@ -260,10 +320,14 @@ export default function (api: any) {
           ensureDefaultProject(peer, defaultProjectName);
           const existing = peer.projects.find((p) => !p.archived && p.name.toLowerCase() === name.toLowerCase());
           if (existing) {
+            peer.previousProjectId = peer.activeProjectId || peer.previousProjectId;
             peer.activeProjectId = existing.id;
             peer.lastProjectId = existing.id;
             existing.lastUsedAt = nowIso();
             peer.pendingReset = true;
+            if (ctx.channel === "telegram" && typeof messageId === "number") {
+              peer.effectiveFromMessageId = messageId;
+            }
             return { ok: true, project: existing, existed: true };
           }
           const id = slugifyId(name);
@@ -273,9 +337,13 @@ export default function (api: any) {
           }
           const project: Project = { id: finalId, name, createdAt: nowIso(), lastUsedAt: nowIso() };
           peer.projects.push(project);
+          peer.previousProjectId = peer.activeProjectId || peer.previousProjectId;
           peer.activeProjectId = project.id;
           peer.lastProjectId = project.id;
           peer.pendingReset = true;
+          if (ctx.channel === "telegram" && typeof messageId === "number") {
+            peer.effectiveFromMessageId = messageId;
+          }
           return { ok: true, project, existed: false };
         });
 
@@ -297,10 +365,14 @@ export default function (api: any) {
           if (!project || project.archived) {
             return { ok: false, error: `Project not found: ${key}` };
           }
+          peer.previousProjectId = peer.activeProjectId || peer.previousProjectId;
           peer.activeProjectId = project.id;
           peer.lastProjectId = project.id;
           project.lastUsedAt = nowIso();
           peer.pendingReset = true;
+          if (ctx.channel === "telegram" && typeof messageId === "number") {
+            peer.effectiveFromMessageId = messageId;
+          }
           return { ok: true, project };
         });
         const res = out.result;
@@ -335,7 +407,7 @@ export default function (api: any) {
         // ignore
       }
 
-      const store = await loadStore(storagePath);
+      const store = await loadStoreCached();
       const peer = store.peers[peerKey] as PeerState | undefined;
       if (!peer) {
         try {
@@ -376,7 +448,7 @@ export default function (api: any) {
       if (peer.pendingReset) {
         peer.pendingReset = false;
         store.peers[peerKey] = peer;
-        await writeJsonAtomic(storagePath, store);
+        await writeStoreAndRefreshCache(store);
       }
 
       const prependContext = clampText(prefixLines.join("\n"), maxPrefixChars);
@@ -392,6 +464,44 @@ export default function (api: any) {
       }
 
       return { prependContext };
+    },
+    { priority: 100 }
+  );
+
+  // Phase 2: hard isolation via per-project room key suffix.
+  api.on(
+    "resolve_room_key",
+    async (event: any, ctx: any) => {
+      if (!hardIsolationEnabled) return undefined;
+      if (event?.channel !== "telegram") return undefined;
+      if (event?.peer?.kind !== "dm") return undefined;
+
+      const peerId = String(event?.peer?.id ?? "").trim();
+      if (!peerId) return undefined;
+
+      const peerKey = `telegram:${peerId}`;
+      const store = await loadStoreCached();
+      const peer = store.peers[peerKey] as PeerState | undefined;
+      if (!peer) return undefined;
+
+      ensureDefaultProject(peer, defaultProjectName);
+
+      const msgId = typeof event?.messageId === "number" ? event.messageId : undefined;
+      const effectiveFrom = typeof peer.effectiveFromMessageId === "number" ? peer.effectiveFromMessageId : undefined;
+
+      // Deterministic semantics: before the switch command's message_id, keep routing to previous project.
+      const activeId =
+        msgId != null && effectiveFrom != null && msgId < effectiveFrom
+          ? (peer.previousProjectId ?? peer.activeProjectId)
+          : peer.activeProjectId;
+
+      const suffix = sanitizeRoomKeySuffixToken(activeId);
+      if (!suffix) return undefined;
+
+      const base = String(event?.roomKey ?? "").trim();
+      if (!base) return undefined;
+
+      return { roomKey: `${base}:proj:${suffix}` };
     },
     { priority: 100 }
   );
