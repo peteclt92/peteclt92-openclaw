@@ -74,15 +74,19 @@ function extractTelegramDmPeerIdFromSessionKey(sessionKey: string): string | nul
 }
 
 function buildPeerKeyFromBeforeAgentStart(ctx: { sessionKey?: string; channelId?: string; conversationId?: string }) {
+  const sessionKeyRaw = (ctx.sessionKey ?? "");
+  const sessionKey = sessionKeyRaw.toLowerCase();
   const channel = (ctx.channelId ?? "unknown").toLowerCase();
-  const sessionKey = (ctx.sessionKey ?? "").toLowerCase();
-  if (channel === "telegram") {
+
+  // Telegram: channelId may be undefined in some gateway contexts; detect via sessionKey.
+  if (channel === "telegram" || sessionKey.includes(":telegram:")) {
     const peer = extractTelegramDmPeerIdFromSessionKey(sessionKey);
     if (peer) return `telegram:${peer}`;
   }
+
   const conv = (ctx.conversationId ?? "").trim();
   if (conv) return `${channel}:${conv}`;
-  if (sessionKey) return `${channel}:${sessionKey}`;
+  if (sessionKeyRaw) return `${channel}:${sessionKeyRaw}`;
   return `${channel}:unknown`;
 }
 
