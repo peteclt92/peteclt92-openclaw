@@ -321,9 +321,30 @@ export default function (api: any) {
         conversationId: ctx?.conversationId,
       });
 
+      // Debug: log context + computed peerKey (even if no state found).
+      try {
+        const log = api?.logger?.info ? api.logger : null;
+        const msg = `[projects-ux] before_agent_start ctx channelId=${String(ctx?.channelId)} conversationId=${String(ctx?.conversationId)} sessionKey=${String(ctx?.sessionKey)} -> peer=${peerKey}`;
+        if (log) log.info(msg);
+        else console.log(msg);
+      } catch {
+        // ignore
+      }
+
       const store = await loadStore(storagePath);
       const peer = store.peers[peerKey] as PeerState | undefined;
-      if (!peer) return undefined;
+      if (!peer) {
+        try {
+          const log = api?.logger?.info ? api.logger : null;
+          const keys = Object.keys(store.peers ?? {}).slice(0, 10).join(",");
+          const msg = `[projects-ux] no peer state for ${peerKey}. knownPeers=${keys}`;
+          if (log) log.info(msg);
+          else console.log(msg);
+        } catch {
+          // ignore
+        }
+        return undefined;
+      }
 
       ensureDefaultProject(peer, defaultProjectName);
       const active = peer.projects.find((p) => p.id === peer.activeProjectId) ?? null;
