@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import crypto from "node:crypto";
 
 type Project = {
   id: string;
@@ -11,6 +12,13 @@ type Project = {
 
   // Projects-scoped durable memory (managed by /memory).
   tokens?: string[];
+};
+
+type PendingWipe = {
+  nonce: string;
+  createdAtMs: number;
+  stamp: string;
+  backupDir: string;
 };
 
 type PeerState = {
@@ -29,6 +37,9 @@ type PeerState = {
 
   // Global (cross-project) durable memory (managed by /memory global ...).
   globalTokens?: string[];
+
+  // Guarded destructive ops.
+  pendingWipe?: PendingWipe;
 };
 
 type Store = {
@@ -52,6 +63,23 @@ function slugifyId(input: string) {
 function randomId(prefix = "p") {
   const rand = Math.random().toString(16).slice(2, 10);
   return `${prefix}-${Date.now().toString(36)}-${rand}`;
+}
+
+function randomNonce(bytes = 4) {
+  return crypto.randomBytes(bytes).toString("hex");
+}
+
+function formatBackupStamp(d = new Date()) {
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return (
+    String(d.getFullYear()) +
+    pad(d.getMonth() + 1) +
+    pad(d.getDate()) +
+    "-" +
+    pad(d.getHours()) +
+    pad(d.getMinutes()) +
+    pad(d.getSeconds())
+  );
 }
 
 async function ensureDir(filePath: string) {
@@ -148,6 +176,7 @@ function buildProjectButtons(peer: PeerState | undefined) {
   }
 
   rows.push([{ text: "New project", callback_data: "/projects new" }]);
+  rows.push([{ text: "More…", callback_data: "/projects more" }]);
   return rows;
 }
 
@@ -267,6 +296,91 @@ export default function (api: any) {
   const maxPrefixChars = Number.isFinite(cfg.maxPrefixChars) ? Math.trunc(cfg.maxPrefixChars) : 240;
 
   const hardIsolationEnabled = Boolean(cfg?.hardIsolation?.enabled);
+  const wipeConfirmTtlMs = 2 * 60 * 1000;
+
+  const projectsUxDir = path.dirname(storagePath);
+  const projectsUxParentDir = path.dirname(projectsUxDir);
+
+  function buildWipePreview(peerKey: string, pending: PendingWipe) {
+    return (
+      "This will delete all Projects state for this DM (projects list + project-scoped memory + any plugin-managed global tokens).\n" +
+      "It will NOT delete anything under ~/projects/ on disk.\n\n" +
+      `Peer: ${peerKey}\n` +
+      `Will delete: ${projectsUxDir}\n` +
+      `Backup will be written to: ${pending.backupDir}\n\n` +
+      "Confirm within 120s:\n" +
+      `/projects wipe confirm ${pending.nonce}`
+    );
+  }
+
+  async function wipeProjectsUxForPeer(peerKey: string, messageId?: number) {
+    const store = await loadStore(storagePath);
+    const existingPeer = store.peers[peerKey] as PeerState | undefined;
+
+    // Preserve global policy settings; wipe resets only user data.
+    const freshPeer: PeerState = {
+      version: 1,
+      projectsEnabled: false,
+      activeProjectId: "",
+      projects: [],
+      previousProjectId: "",
+      lastProjectId: "",
+      pendingReset: false,
+      effectiveFromMessageId: typeof messageId === "number" ? messageId : undefined,
+      globalTokens: [],
+      pendingWipe: undefined,
+    };
+
+    // Ensure one default project exists.
+    ensureDefaultProject(freshPeer, defaultProjectName);
+
+    // Write peer back.
+    store.peers[peerKey] = freshPeer;
+    await writeStoreAndRefreshCache(store);
+
+    // Also reset in-memory cache entry if present.
+    cachedStore = store;
+    cachedStoreLoadedAtMs = Date.now();
+
+    return { ok: true, peer: freshPeer, hadPeer: Boolean(existingPeer) };
+  }
+
+  async function backupAndResetProjectsUx(peerKey: string, pending: PendingWipe, messageId?: number) {
+    const stamp = pending.stamp;
+    const backupDir = pending.backupDir;
+    const backupTarget = path.join(backupDir, "projects-ux");
+
+    // Backup first.
+    await fs.mkdir(backupDir, { recursive: true });
+    try {
+      // Copy the whole plugin directory (future-proof).
+      await fs.cp(projectsUxDir, backupTarget, { recursive: true });
+    } catch {
+      // If directory doesn't exist, backup is still valid as an empty directory.
+      await fs.mkdir(backupTarget, { recursive: true });
+    }
+
+    // Atomic-ish wipe: rename away, recreate fresh, then best-effort cleanup.
+    const deletingDir = `${projectsUxDir}.DELETING.${stamp}`;
+    try {
+      await fs.rename(projectsUxDir, deletingDir);
+    } catch {
+      // If it doesn't exist, that's fine.
+    }
+
+    // Recreate fresh state.
+    await fs.mkdir(projectsUxDir, { recursive: true });
+    await wipeProjectsUxForPeer(peerKey, messageId);
+
+    // Best-effort delete of the renamed dir.
+    try {
+      await fs.rm(deletingDir, { recursive: true, force: true });
+    } catch {
+      // Keep it around; backup already exists.
+    }
+
+    return { ok: true, backupDir };
+  }
 
   // In-memory store cache (avoid reading JSON on every inbound message).
   let cachedStore: Store | null = null;
@@ -332,7 +446,9 @@ export default function (api: any) {
           "/projects off\n" +
           "/projects list\n" +
           "/projects new <name>\n" +
-          "/projects switch <name|id>\n\n" +
+          "/projects switch <name|id>\n" +
+          "/projects more\n" +
+          "/projects wipe\n\n" +
           "Alias (deprecated): /project\n\n" +
           "Durable memory (scoped by default):\n" +
           "/memory remember <token>\n" +
@@ -426,6 +542,112 @@ export default function (api: any) {
         ];
 
         return { text: lines.join("\n") };
+      }
+
+      if (sub === "more") {
+        const store = await loadStore(storagePath);
+        const peer = store.peers[peerKey] as PeerState | undefined;
+        if (peer) {
+          const changed = ensureDefaultProject(peer, defaultProjectName);
+          if (changed) {
+            store.peers[peerKey] = peer;
+            await writeStoreAndRefreshCache(store);
+          }
+        }
+
+        return {
+          text:
+            "More actions:\n" +
+            "- /projects wipe (reset Projects state for this DM)\n\n" +
+            "This does NOT touch ~/projects/.",
+          channelData: {
+            telegram: {
+              buttons: [
+                [{ text: "Back", callback_data: "/projects" }],
+                [{ text: "Wipe projects…", callback_data: "/projects wipe" }],
+              ],
+            },
+          },
+        };
+      }
+
+      if (sub === "wipe") {
+        const action = (parts[1] ?? "").toLowerCase();
+        const argNonce = parts[2] ?? "";
+
+        const store = await loadStore(storagePath);
+        const peer = (store.peers[peerKey] as PeerState | undefined) ?? {
+          version: 1,
+          projectsEnabled: false,
+          activeProjectId: "",
+          projects: [],
+          globalTokens: [],
+        };
+
+        // Cancel
+        if (action === "cancel") {
+          if (peer.pendingWipe) {
+            peer.pendingWipe = undefined;
+            store.peers[peerKey] = peer;
+            await writeStoreAndRefreshCache(store);
+          }
+          return { text: "Cancelled. Projects state was not changed." };
+        }
+
+        // Confirm
+        if (action === "confirm") {
+          const pending = peer.pendingWipe;
+          if (!pending) {
+            return { text: "No wipe pending. Run /projects wipe first." };
+          }
+          if (Date.now() - pending.createdAtMs > wipeConfirmTtlMs) {
+            peer.pendingWipe = undefined;
+            store.peers[peerKey] = peer;
+            await writeStoreAndRefreshCache(store);
+            return { text: "Wipe confirmation expired. Run /projects wipe again." };
+          }
+          if (!argNonce || argNonce !== pending.nonce) {
+            return { text: "Invalid confirmation token. Run /projects wipe again." };
+          }
+
+          // Execute: backup + atomic-ish reset.
+          peer.pendingWipe = undefined;
+          store.peers[peerKey] = peer;
+          await writeStoreAndRefreshCache(store);
+
+          const res = await backupAndResetProjectsUx(peerKey, pending, messageId);
+
+          return {
+            text:
+              "Wiped Projects state for this DM.\n" +
+              `Backup: ${res.backupDir}\n\n` +
+              "Mode is now Classic (Projects OFF).",
+          };
+        }
+
+        // First invocation: generate nonce + store pendingWipe, then show confirmation view.
+        const stamp = formatBackupStamp();
+        const pending: PendingWipe = {
+          nonce: randomNonce(4),
+          createdAtMs: Date.now(),
+          stamp,
+          backupDir: path.join(projectsUxParentDir, `backup_projects_ux_${stamp}`),
+        };
+        peer.pendingWipe = pending;
+        store.peers[peerKey] = peer;
+        await writeStoreAndRefreshCache(store);
+
+        return {
+          text: buildWipePreview(peerKey, pending),
+          channelData: {
+            telegram: {
+              buttons: [
+                [{ text: "Cancel", callback_data: "/projects wipe cancel" }],
+                [{ text: "Confirm WIPE", callback_data: `/projects wipe confirm ${pending.nonce}` }],
+              ],
+            },
+          },
+        };
       }
 
       if (sub === "on") {
