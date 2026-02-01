@@ -189,9 +189,9 @@ async function withPeerState<T>(filePath: string, peerKey: string, fn: (peer: Pe
 function ensureDefaultProject(peer: PeerState, defaultProjectName: string): boolean {
   let changed = false;
 
-  // Migration: older versions used "Inbox" as the default project name.
-  // Users read "Inbox" as "the classic chat" which is not true in Projects mode.
-  // Rename it to the configured default (default: General) and persist.
+  // Migration: older versions used a default project name of "Inbox" (legacy).
+  // Users read "Inbox" as "the classic chat", which is not true in Projects mode.
+  // Rename legacy "Inbox" projects to the configured default (default: "General") and persist.
   for (const p of peer.projects) {
     const name = (p.name ?? "").trim().toLowerCase();
     const id = (p.id ?? "").trim().toLowerCase();
