@@ -4,7 +4,11 @@ Scope: **projects-ux plugin only** (`/home/pete/clawd/extensions/projects-ux`).
 
 ## What this feature changes
 
-- Adds a destructive command: `/projects wipe` with a two-step nonce confirmation.
+- Adds a destructive Reset/Wipe UX under `/projects` → `More…` → `Reset…`.
+- Supports:
+  - wiping **one** project (primary)
+  - wiping **all** Projects-UX state for this DM (recovery)
+- All destructive actions are guarded by a 2-step nonce confirmation + automatic backups.
 - Deletes **only** `projects-ux` plugin state under `~/.openclaw/projects-ux/`.
 - Does **not** touch:
   - `~/projects/` on disk

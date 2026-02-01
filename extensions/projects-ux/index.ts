@@ -17,6 +17,9 @@ type Project = {
 type PendingWipe = {
   nonce: string;
   createdAtMs: number;
+  kind: "all" | "project";
+  projectId?: string;
+  // Preview info (also returned to user)
   stamp: string;
   backupDir: string;
 };
@@ -350,36 +353,127 @@ export default function (api: any) {
     const backupDir = pending.backupDir;
     const backupTarget = path.join(backupDir, "projects-ux");
 
-    // Backup first.
+    // Backup MUST happen before any mutation.
     await fs.mkdir(backupDir, { recursive: true });
     try {
-      // Copy the whole plugin directory (future-proof).
       await fs.cp(projectsUxDir, backupTarget, { recursive: true });
-    } catch {
-      // If directory doesn't exist, backup is still valid as an empty directory.
-      await fs.mkdir(backupTarget, { recursive: true });
+    } catch (err: any) {
+      // ENOENT is fine (no prior state). Any other backup failure aborts.
+      if (err?.code === "ENOENT") {
+        await fs.mkdir(backupTarget, { recursive: true });
+      } else {
+        throw err;
+      }
     }
 
-    // Atomic-ish wipe: rename away, recreate fresh, then best-effort cleanup.
+    // Atomic-ish: rename the plugin directory away.
     const deletingDir = `${projectsUxDir}.DELETING.${stamp}`;
     try {
       await fs.rename(projectsUxDir, deletingDir);
-    } catch {
-      // If it doesn't exist, that's fine.
+    } catch (err: any) {
+      if (err?.code !== "ENOENT") throw err;
     }
 
-    // Recreate fresh state.
+    // Recreate baseline directory immediately.
     await fs.mkdir(projectsUxDir, { recursive: true });
+
+    // Preserve other peers and future plugin files by copying back the old directory contents,
+    // then rewriting state.json for the target peer.
+    try {
+      await fs.cp(deletingDir, projectsUxDir, { recursive: true });
+    } catch {
+      // ok
+    }
+
+    // Reset only THIS peer's data.
     await wipeProjectsUxForPeer(peerKey, messageId);
 
     // Best-effort delete of the renamed dir.
     try {
       await fs.rm(deletingDir, { recursive: true, force: true });
     } catch {
-      // Keep it around; backup already exists.
+      // keep it; backup already exists
     }
 
     return { ok: true, backupDir };
+  }
+
+  async function backupAndWipeOneProject(peerKey: string, pending: PendingWipe, projectId: string, messageId?: number) {
+    const stamp = pending.stamp;
+    const backupDir = pending.backupDir;
+    const backupTarget = path.join(backupDir, "projects-ux");
+
+    // Backup MUST happen before any mutation.
+    await fs.mkdir(backupDir, { recursive: true });
+    try {
+      await fs.cp(projectsUxDir, backupTarget, { recursive: true });
+    } catch (err: any) {
+      if (err?.code === "ENOENT") {
+        await fs.mkdir(backupTarget, { recursive: true });
+      } else {
+        return { ok: false, error: `Backup failed; aborting wipe. (${String(err?.code ?? err)})` };
+      }
+    }
+
+    const store = await loadStore(storagePath);
+    const peer = store.peers[peerKey] as PeerState | undefined;
+    if (!peer) {
+      return { ok: false, error: "Refused: no peer state." };
+    }
+
+    const changed = ensureDefaultProject(peer, defaultProjectName);
+    if (changed) {
+      store.peers[peerKey] = peer;
+    }
+
+    const defaultProjectId = `proj-${slugifyId(defaultProjectName) || "general"}`;
+    if (projectId === defaultProjectId) {
+      return { ok: false, error: "Refused: default project cannot be wiped." };
+    }
+
+    const target = peer.projects.find((p) => p.id === projectId && !p.archived) ?? null;
+    if (!target) {
+      return { ok: false, error: `Refused: unknown projectId: ${projectId}` };
+    }
+
+    // Remove only the target project's plugin-owned state.
+    peer.projects = peer.projects.filter((p) => p.id !== projectId);
+
+    const wasActive = peer.activeProjectId === projectId;
+    const wasPrev = peer.previousProjectId === projectId;
+    const wasLast = peer.lastProjectId === projectId;
+
+    if (wasActive || wasPrev || wasLast) {
+      peer.activeProjectId = defaultProjectId;
+      peer.previousProjectId = undefined;
+      peer.lastProjectId = defaultProjectId;
+      peer.pendingReset = true;
+    }
+
+    // Preserve Projects mode flag.
+    if (peer.projectsEnabled !== true && peer.projectsEnabled !== false) {
+      peer.projectsEnabled = false;
+    }
+
+    if (typeof messageId === "number") {
+      peer.effectiveFromMessageId = messageId;
+    }
+
+    // Ensure the peer has a valid default project.
+    ensureDefaultProject(peer, defaultProjectName);
+
+    store.peers[peerKey] = peer;
+    await writeStoreAndRefreshCache(store);
+
+    const active = peer.projects.find((p) => p.id === peer.activeProjectId) ?? peer.projects[0];
+
+    return {
+      ok: true,
+      backupDir,
+      projectName: target.name,
+      projectsEnabled: peer.projectsEnabled === true,
+      activeProjectName: active?.name ?? defaultProjectName,
+    };
   }
 
   // In-memory store cache (avoid reading JSON on every inbound message).
@@ -545,36 +639,148 @@ export default function (api: any) {
       }
 
       if (sub === "more") {
-        const store = await loadStore(storagePath);
-        const peer = store.peers[peerKey] as PeerState | undefined;
-        if (peer) {
-          const changed = ensureDefaultProject(peer, defaultProjectName);
-          if (changed) {
-            store.peers[peerKey] = peer;
-            await writeStoreAndRefreshCache(store);
-          }
-        }
-
         return {
-          text:
-            "More actions:\n" +
-            "- /projects wipe (reset Projects state for this DM)\n\n" +
-            "This does NOT touch ~/projects/.",
+          text: "More…",
           channelData: {
             telegram: {
               buttons: [
                 [{ text: "Back", callback_data: "/projects" }],
-                [{ text: "Wipe projects…", callback_data: "/projects wipe" }],
+                [
+                  { text: "Debug", callback_data: "/projects debug" },
+                  { text: "Memory…", callback_data: "/projects memory" },
+                ],
+                [{ text: "Reset…", callback_data: "/projects reset" }],
               ],
             },
           },
         };
       }
 
-      if (sub === "wipe") {
-        const action = (parts[1] ?? "").toLowerCase();
-        const argNonce = parts[2] ?? "";
+      if (sub === "memory") {
+        return {
+          text:
+            "Memory (scoped):\n" +
+            "- /memory remember <token>\n" +
+            "- /memory list\n\n" +
+            "Global memory (explicit):\n" +
+            "- /memory global remember <token>\n" +
+            "- /memory global list\n\n" +
+            "Note: transcripts are never modified by Projects reset/wipe.",
+          channelData: {
+            telegram: {
+              buttons: [[{ text: "Back", callback_data: "/projects more" }]],
+            },
+          },
+        };
+      }
 
+      if (sub === "reset") {
+        const action = (parts[1] ?? "").toLowerCase();
+
+        if (!action) {
+          return {
+            text:
+              "Reset / Wipe (Projects-UX state for this DM)\n\n" +
+              "- Remove (wipe) ONE project…\n" +
+              "- Wipe ALL projects… (recovery)\n\n" +
+              "Transcripts/history are never deleted.",
+            channelData: {
+              telegram: {
+                buttons: [
+                  [{ text: "Cancel", callback_data: "/projects more" }],
+                  [{ text: "Remove (wipe) ONE project…", callback_data: "/projects reset remove" }],
+                  [{ text: "Wipe ALL projects…", callback_data: "/projects wipe" }],
+                ],
+              },
+            },
+          };
+        }
+
+        if (action === "remove") {
+          const projectId = parts[2] ?? "";
+          const store = await loadStore(storagePath);
+          const peer = store.peers[peerKey] as PeerState | undefined;
+          if (!peer) return { text: "No Projects state yet for this DM." };
+
+          const changed = ensureDefaultProject(peer, defaultProjectName);
+          if (changed) {
+            store.peers[peerKey] = peer;
+            await writeStoreAndRefreshCache(store);
+          }
+
+          const defaultProjectId = `proj-${slugifyId(defaultProjectName) || "general"}`;
+          const candidates = peer.projects.filter((p) => !p.archived && p.id !== defaultProjectId);
+
+          // No id -> show picker
+          if (!projectId) {
+            if (candidates.length === 0) {
+              return {
+                text: "No removable projects (only the default project exists).",
+                channelData: { telegram: { buttons: [[{ text: "Back", callback_data: "/projects reset" }]] } },
+              };
+            }
+
+            const rows: Array<Array<{ text: string; callback_data: string }>> = [];
+            for (let i = 0; i < candidates.length; i += 2) {
+              const row: Array<{ text: string; callback_data: string }> = [];
+              const a = candidates[i];
+              const b = candidates[i + 1];
+              if (a) row.push({ text: a.name, callback_data: `/projects reset remove ${a.id}` });
+              if (b) row.push({ text: b.name, callback_data: `/projects reset remove ${b.id}` });
+              rows.push(row);
+            }
+            rows.push([{ text: "Cancel", callback_data: "/projects reset" }]);
+
+            return {
+              text: "Select a project to wipe (default project cannot be removed):",
+              channelData: { telegram: { buttons: rows } },
+            };
+          }
+
+          // Arm per-project wipe confirmation
+          if (projectId === defaultProjectId) {
+            return { text: "Refused: default project cannot be wiped." };
+          }
+          const project = peer.projects.find((p) => p.id === projectId && !p.archived) ?? null;
+          if (!project) {
+            return { text: `Refused: unknown projectId: ${projectId}` };
+          }
+
+          const stamp = formatBackupStamp();
+          const pending: PendingWipe = {
+            kind: "project",
+            projectId,
+            nonce: randomNonce(4),
+            createdAtMs: Date.now(),
+            stamp,
+            backupDir: path.join(projectsUxParentDir, `backup_projects_ux_${stamp}`),
+          };
+          peer.pendingWipe = pending;
+          store.peers[peerKey] = peer;
+          await writeStoreAndRefreshCache(store);
+
+          return {
+            text:
+              `This will wipe ONE project for this DM:\n\n` +
+              `Project: ${project.name} (${project.id})\n` +
+              "Removes: project entry + project-scoped memory (plugin-owned).\n" +
+              `Backup: ${pending.backupDir}\n\n` +
+              "Confirm within 120s.",
+            channelData: {
+              telegram: {
+                buttons: [
+                  [{ text: "Cancel", callback_data: "/projects wipe cancel" }],
+                  [{ text: "Confirm WIPE", callback_data: `/projects wipe project confirm ${pending.nonce} ${project.id}` }],
+                ],
+              },
+            },
+          };
+        }
+
+        return { text: "Unknown reset action." };
+      }
+
+      if (sub === "wipe") {
         const store = await loadStore(storagePath);
         const peer = (store.peers[peerKey] as PeerState | undefined) ?? {
           version: 1,
@@ -584,66 +790,115 @@ export default function (api: any) {
           globalTokens: [],
         };
 
-        // Cancel
-        if (action === "cancel") {
+        const action = (parts[1] ?? "").toLowerCase();
+
+        const clearPending = async () => {
           if (peer.pendingWipe) {
             peer.pendingWipe = undefined;
             store.peers[peerKey] = peer;
             await writeStoreAndRefreshCache(store);
           }
-          return { text: "Cancelled. Projects state was not changed." };
+        };
+
+        // Cancel
+        if (action === "cancel") {
+          await clearPending();
+          return { text: "Cancelled. Nothing was deleted." };
         }
 
-        // Confirm
+        // Confirm ALL: /projects wipe confirm <nonce>
         if (action === "confirm") {
+          const argNonce = parts[2] ?? "";
           const pending = peer.pendingWipe;
-          if (!pending) {
-            return { text: "No wipe pending. Run /projects wipe first." };
+          if (!pending) return { text: "No wipe pending. Use /projects → More… → Reset…" };
+
+          const expired = Date.now() - pending.createdAtMs > wipeConfirmTtlMs;
+          const mismatch = !argNonce || argNonce !== pending.nonce || pending.kind !== "all";
+          if (expired) {
+            await clearPending();
+            return { text: "Refused: nonce expired. Re-run Reset…" };
           }
-          if (Date.now() - pending.createdAtMs > wipeConfirmTtlMs) {
-            peer.pendingWipe = undefined;
-            store.peers[peerKey] = peer;
-            await writeStoreAndRefreshCache(store);
-            return { text: "Wipe confirmation expired. Run /projects wipe again." };
-          }
-          if (!argNonce || argNonce !== pending.nonce) {
-            return { text: "Invalid confirmation token. Run /projects wipe again." };
+          if (mismatch) {
+            await clearPending();
+            return { text: "Refused: nonce mismatch or wrong scope. Re-run Reset…" };
           }
 
-          // Execute: backup + atomic-ish reset.
-          peer.pendingWipe = undefined;
-          store.peers[peerKey] = peer;
-          await writeStoreAndRefreshCache(store);
+          await clearPending();
 
           const res = await backupAndResetProjectsUx(peerKey, pending, messageId);
-
           return {
             text:
-              "Wiped Projects state for this DM.\n" +
-              `Backup: ${res.backupDir}\n\n` +
-              "Mode is now Classic (Projects OFF).",
+              "WIPED ALL projects state for this DM.\n" +
+              `Backup: ${res.backupDir}\n` +
+              "Mode: Classic (Projects OFF)\n" +
+              "Active project: " + defaultProjectName + "\n\n" +
+              "Next: /projects (or /projects debug)",
           };
         }
 
-        // First invocation: generate nonce + store pendingWipe, then show confirmation view.
+        // Confirm ONE: /projects wipe project confirm <nonce> <id>
+        if (action === "project" && (parts[2] ?? "").toLowerCase() === "confirm") {
+          const argNonce = parts[3] ?? "";
+          const projectId = parts[4] ?? "";
+          const pending = peer.pendingWipe;
+          if (!pending) return { text: "No wipe pending. Use /projects → More… → Reset…" };
+
+          const expired = Date.now() - pending.createdAtMs > wipeConfirmTtlMs;
+          const mismatch =
+            !argNonce ||
+            argNonce !== pending.nonce ||
+            pending.kind !== "project" ||
+            !pending.projectId ||
+            pending.projectId !== projectId;
+
+          if (expired) {
+            await clearPending();
+            return { text: "Refused: nonce expired. Re-run Reset…" };
+          }
+          if (mismatch) {
+            await clearPending();
+            return { text: "Refused: nonce mismatch or wrong projectId. Re-run Reset…" };
+          }
+
+          // Execute per-project wipe.
+          await clearPending();
+          const res = await backupAndWipeOneProject(peerKey, pending, projectId, messageId);
+          if (!res.ok) return { text: res.error };
+
+          return {
+            text:
+              `WIPED project: ${res.projectName} (${projectId})\n` +
+              `Backup: ${res.backupDir}\n\n` +
+              `Mode: ${res.projectsEnabled ? "Projects ON" : "Classic (Projects OFF)"}\n` +
+              `Active project: ${res.activeProjectName}\n\n` +
+              "Next: /projects (or /projects debug)",
+          };
+        }
+
+        // Arm WIPE ALL (legacy entrypoint): /projects wipe
         const stamp = formatBackupStamp();
         const pending: PendingWipe = {
+          kind: "all",
           nonce: randomNonce(4),
           createdAtMs: Date.now(),
           stamp,
           backupDir: path.join(projectsUxParentDir, `backup_projects_ux_${stamp}`),
         };
+
         peer.pendingWipe = pending;
         store.peers[peerKey] = peer;
         await writeStoreAndRefreshCache(store);
 
         return {
-          text: buildWipePreview(peerKey, pending),
+          text:
+            "This will WIPE ALL Projects-UX state for this DM (recovery).\n\n" +
+            `Backup: ${pending.backupDir}\n` +
+            "Confirm within 120s.",
           channelData: {
             telegram: {
               buttons: [
                 [{ text: "Cancel", callback_data: "/projects wipe cancel" }],
-                [{ text: "Confirm WIPE", callback_data: `/projects wipe confirm ${pending.nonce}` }],
+                [{ text: "Confirm WIPE ALL", callback_data: `/projects wipe confirm ${pending.nonce}` }],
               ],
             },
           },
