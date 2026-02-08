@@ -17,7 +17,8 @@ cd /home/pete/projects/node-banana-polished
 
 - Streams output to console and logs it to:
   - `<repo>/.codex-watch/<timestamp>-<label>.log`
-- On completion, sends:
+- Sends a **start** wake immediately when the command begins (includes Codex Logbook URL + log path).
+- On completion, sends another wake:
   - `openclaw gateway call cron.wake --params '{"text":"...","mode":"now"}'`
 - Exit code matches the wrapped command’s exit code.
 
