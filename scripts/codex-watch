@@ -59,6 +59,16 @@ fi
 MSG="${MSG} | log=${LOG_PATH}"
 
 # Best-effort wake (do not fail the wrapper if notification fails).
-(openclaw gateway call cron.wake --params "{\"text\":\"${MSG//"/\\\"}\",\"mode\":\"now\"}" >/dev/null 2>&1) || true
+# Build JSON safely to avoid shell-escaping bugs.
+PARAMS_JSON=""
+if command -v python3 >/dev/null 2>&1; then
+  PARAMS_JSON="$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1], "mode": "now"}))' "$MSG")"
+else
+  # Fallback: extremely simple escape (best-effort)
+  ESCAPED_MSG="${MSG//\"/\\\"}"
+  PARAMS_JSON="{\"text\":\"${ESCAPED_MSG}\",\"mode\":\"now\"}"
+fi
+
+(openclaw gateway call cron.wake --params "$PARAMS_JSON" >/dev/null 2>&1) || true
 
 exit "$EC"
